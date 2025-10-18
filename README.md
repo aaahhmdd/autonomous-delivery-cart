@@ -43,5 +43,5 @@ Databases: PostgreSQL (RDS), DynamoDB
 
 🤝 Team Members
 
-Ahmed: Cloud Architecture & Backend Development
+
 
