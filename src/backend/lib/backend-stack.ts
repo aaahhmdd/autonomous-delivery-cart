@@ -1,26 +1,53 @@
-    import * as cdk from 'aws-cdk-lib';
-    import { Construct } from 'constructs';
-    // 1. Import the S3 library from the CDK
-    import * as s3 from 'aws-cdk-lib/aws-s3';
-    
-    export class BackendStack extends cdk.Stack {
-      constructor(scope: Construct, id: string, props?: cdk.StackProps) {
-        super(scope, id, props);
-    
-        // 2. Define a new S3 Bucket resource
-        new s3.Bucket(this, 'MyFirstGradProjectBucket', {
-          // NOTE: S3 bucket names must be globally unique. 
-          // If you leave 'bucketName' out, the CDK will automatically generate a unique name for you, which is best practice.
-          
-          // This setting is VERY important for development. It ensures that when you
-          // run `cdk destroy`, the bucket and all its contents will be automatically deleted.
-          // Without this, you could be left with orphaned resources.
-          removalPolicy: cdk.RemovalPolicy.DESTROY,
-          autoDeleteObjects: true, 
-        });
-      }
-    }
-    
+import * as cdk from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
+
+export class BackendStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    // Define the User Pool 
+    const userPool = new cognito.UserPool(this, 'GradProjectUserPool', {
+      userPoolName: 'autonomous-delivery-cart-users',
+      selfSignUpEnabled: true,
+      signInAliases: {
+        email: true,
+      },
+      autoVerify: {
+        email: true,
+      },
+      passwordPolicy: {
+        minLength: 8,
+        requireLowercase: true,
+        requireDigits: true,
+        requireSymbols: false,
+        requireUppercase: true,
+      },
+      mfa: cognito.Mfa.OFF,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Define a "User Pool Client" 
+    const userPoolClient = userPool.addClient('AppClient', {
+      userPoolClientName: 'mobile-app-client',
+      
+      authFlows: {
+        userSrp: true,
+      },
+    });
+
+    // Output the key IDs for mobile app - this syntax remains the same
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: userPool.userPoolId,
+      description: 'The ID of the Cognito User Pool',
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolClientId', {
+      value: userPoolClient.userPoolClientId,
+      description: 'The ID of the User Pool Client for the mobile app',
+    });
+  }
+}
 
 
 
