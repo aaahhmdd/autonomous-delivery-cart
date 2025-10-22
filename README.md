@@ -30,18 +30,6 @@ Cart Firmware: Python, ROS (Robot Operating System) on NVIDIA Jetson
 
 Databases: PostgreSQL (RDS), DynamoDB
 
-📂 Repository Structure
-
-.
-├── docs/                # All project documentation (SRS, BRD, ERD, etc.)
-└── src/                 # All source code
-    ├── backend/         # AWS CDK and Lambda code (Ahmed)
-    ├── mobile-app/      # Mobile application code (Youssef)
-    ├── vendor-web-app/  # Vendor dashboard code
-    └── cart-firmware/   # Jetson Nano Python/ROS code
-
-
-🤝 Team Members
 
 
 
