@@ -1,7 +1,9 @@
+/*
+
 /**
  * This Lambda function handles all API requests related to orders.
  * Version: Cost-$0 (No NAT, no Secrets Manager)
- */
+
 
  // --- SDK and Library Imports ---
 import { Client } from 'pg';
@@ -12,7 +14,7 @@ const { DB_HOST, DB_NAME, DB_USER, DB_PASSWORD } = process.env;
 
 /**
  * Main Lambda Handler
- */
+
 export async function handler(
   event: APIGatewayProxyEvent
 ): Promise<APIGatewayProxyResult> {
@@ -222,3 +224,206 @@ export async function handler(
   }
 }
 
+*/
+
+
+
+
+
+
+
+
+
+
+// lambda/orderHandler.ts
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { getPool } from './dbPool';
+
+type OrderItem = {
+  product_id: number;
+  quantity: number;
+  // client-sent price_at_purchase will be ignored and replaced by server computed price
+};
+
+export async function handler(
+  event: APIGatewayProxyEvent
+): Promise<APIGatewayProxyResult> {
+  console.log('Event:', JSON.stringify(event, null, 2));
+  const pool = getPool();
+  const client = await pool.connect();
+
+  try {
+    // --- auth: Cognito sub
+    const cognitoUserId = event.requestContext.authorizer?.claims.sub;
+    if (!cognitoUserId) {
+      return { statusCode: 401, body: JSON.stringify('Unauthorized') };
+    }
+
+    const httpMethod = event.httpMethod;
+    const path = event.path;
+
+    // --- GET /orders & GET /orders/{orderId} & vendor orders handled below (unchanged)
+    if (httpMethod === 'POST' && path === '/orders') {
+      const body = JSON.parse(event.body || '{}');
+
+      // Idempotency: prefer header, fallback to body
+      const idempotencyKey =
+        (event.headers && (event.headers['Idempotency-Key'] || event.headers['idempotency-key'])) ||
+        body.idempotency_key ||
+        null;
+
+      const vendor_id = body.vendor_id;
+      const delivery_location = body.delivery_location;
+      const items = body.items as OrderItem[] | undefined;
+
+      // basic validation
+      if (!vendor_id || !delivery_location || !items || !Array.isArray(items) || items.length === 0) {
+        return {
+          statusCode: 400,
+          body: JSON.stringify('Bad Request: Missing required fields (vendor_id, delivery_location, items)'),
+        };
+      }
+
+      // find internal user id
+      const userRes = await client.query('SELECT id, role FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      if (userRes.rows.length === 0) {
+        return { statusCode: 404, body: JSON.stringify('User profile not found. Please complete profile.') };
+      }
+      const internalUserId = userRes.rows[0].id;
+
+      // --- Idempotency check
+      if (idempotencyKey) {
+        const existing = await client.query(
+          'SELECT id, status, total_amount FROM orders WHERE idempotency_key = $1 AND customer_id = $2',
+          [idempotencyKey, internalUserId]
+        );
+        if (existing.rows.length > 0) {
+          return {
+            statusCode: 200,
+            body: JSON.stringify({ orderId: existing.rows[0].id, status: existing.rows[0].status, total_amount: existing.rows[0].total_amount }),
+          };
+        }
+      }
+
+      // --- 1) Recompute total server-side using inventories prices
+      // gather product ids
+      const productIds = items.map((it) => Number(it.product_id));
+      // query inventory for those products for the given vendor
+      const q = `
+        SELECT product_id, price
+        FROM inventories
+        WHERE vendor_id = $1 AND product_id = ANY($2::int[])
+      `;
+      const invRes = await client.query(q, [vendor_id, productIds]);
+
+      // build map product_id -> price
+      const priceMap = new Map<number, number>();
+      invRes.rows.forEach((r: any) => priceMap.set(Number(r.product_id), Number(r.price)));
+
+      // compute total
+      let computedTotal = 0;
+      for (const it of items) {
+        const pid = Number(it.product_id);
+        const qty = Number(it.quantity);
+        const price = priceMap.get(pid);
+        if (price === undefined) {
+          return { statusCode: 400, body: JSON.stringify(`Bad Request: product ${pid} not found for vendor ${vendor_id}`) };
+        }
+        if (!Number.isFinite(qty) || qty <= 0) {
+          return { statusCode: 400, body: JSON.stringify(`Bad Request: invalid quantity for product ${pid}`) };
+        }
+        computedTotal += price * qty;
+      }
+
+      // --- 2) Create order and items in transaction
+      try {
+        await client.query('BEGIN');
+
+        const orderInsert = `
+          INSERT INTO orders (customer_id, vendor_id, status, delivery_location, total_amount, created_at, updated_at, idempotency_key)
+          VALUES ($1, $2, 'pending', $3, $4, NOW(), NOW(), $5)
+          RETURNING id, created_at;
+        `;
+        const orderRes = await client.query(orderInsert, [internalUserId, vendor_id, delivery_location, computedTotal, idempotencyKey]);
+        const newOrderId = orderRes.rows[0].id;
+
+        // insert order items
+        const insertItemText = `
+          INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase)
+          VALUES ($1, $2, $3, $4)
+        `;
+        for (const it of items) {
+          const pid = Number(it.product_id);
+          const qty = Number(it.quantity);
+          const price = priceMap.get(pid)!;
+          await client.query(insertItemText, [newOrderId, pid, qty, price]);
+        }
+
+        await client.query('COMMIT');
+        return {
+          statusCode: 201,
+          body: JSON.stringify({ orderId: newOrderId, total_amount: computedTotal }),
+          headers: { 'Content-Type': 'application/json' },
+        };
+      } catch (txErr) {
+        await client.query('ROLLBACK');
+        console.error('Transaction error:', txErr);
+        return { statusCode: 500, body: JSON.stringify('Internal Server Error during order creation') };
+      }
+    }
+
+    // --- GET /orders (customer) ---
+    if (httpMethod === 'GET' && path === '/orders') {
+      const userRes = await client.query('SELECT id FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      if (userRes.rows.length === 0) {
+        return { statusCode: 404, body: JSON.stringify('User profile not found') };
+      }
+      const uid = userRes.rows[0].id;
+      const res = await client.query('SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC', [uid]);
+      return { statusCode: 200, body: JSON.stringify(res.rows), headers: { 'Content-Type': 'application/json' } };
+    }
+
+    // --- GET /orders/{orderId} ---
+    if (httpMethod === 'GET' && event.pathParameters?.orderId) {
+      const orderId = event.pathParameters.orderId;
+      const userRes = await client.query('SELECT id FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      const uid = userRes.rows[0].id;
+      const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 AND customer_id = $2', [orderId, uid]);
+      if (orderRes.rows.length === 0) {
+        return { statusCode: 404, body: JSON.stringify('Order not found or access denied') };
+      }
+      const itemsRes = await client.query(
+        `SELECT oi.*, p.name as product_name, p.image_url as product_image_url
+         FROM order_items oi JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`,
+        [orderId]
+      );
+      const detailed = orderRes.rows[0];
+      detailed.items = itemsRes.rows;
+      return { statusCode: 200, body: JSON.stringify(detailed), headers: { 'Content-Type': 'application/json' } };
+    }
+
+    // --- GET /vendors/{id}/orders (vendor) ---
+    if (httpMethod === 'GET' && path.startsWith('/vendors/') && path.endsWith('/orders')) {
+      // path param id
+      const vendorIdFromPath = event.pathParameters?.id;
+      const userRes = await client.query('SELECT id, role FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      if (userRes.rows.length === 0) {
+        return { statusCode: 404, body: JSON.stringify('User profile not found') };
+      }
+      const internalUserId = userRes.rows[0].id;
+      const userRole = userRes.rows[0].role;
+      if (userRole !== 'vendor' || internalUserId.toString() !== vendorIdFromPath) {
+        return { statusCode: 403, body: JSON.stringify('Forbidden: Not a vendor or access denied') };
+      }
+      const res = await client.query('SELECT * FROM orders WHERE vendor_id = $1 ORDER BY created_at DESC', [internalUserId]);
+      return { statusCode: 200, body: JSON.stringify(res.rows), headers: { 'Content-Type': 'application/json' } };
+    }
+
+    return { statusCode: 405, body: JSON.stringify('Method Not Allowed') };
+  } catch (err) {
+    console.error('Lambda handler error:', err);
+    return { statusCode: 500, body: JSON.stringify({ error: 'Internal Server Error', message: (err as Error).message }) };
+  } finally {
+    client.release();
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "info": {
+    "name": "Autonomous Delivery Cart - API Tests",
+    "_postman_id": "carta-autodelivery-tests",
+    "description": "Postman collection for profile, products and orders endpoints (Assumes API Gateway with Cognito authorizer). Replace {{base_url}} and {{auth_token}} variables.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "https://duprce0ed8.execute-api.me-south-1.amazonaws.com/prod/", "type": "string" },
+    { "key": "auth_token", "value": "eyJraWQiOiI1RGdycnVBRE1odDNPRlZBUTlxMDVZeVwvVndXREFDaEVkMlBRU2FrZ1NVRT0iLCJhbGciOiJSUzI1NiJ9.eyJzdWIiOiI3MTAwMzUzMC1lMGExLTcwODEtNDZjNS0wMTg4MTg5Mjk5Y2EiLCJpc3MiOiJodHRwczpcL1wvY29nbml0by1pZHAubWUtc291dGgtMS5hbWF6b25hd3MuY29tXC9tZS1zb3V0aC0xX2lFa2YwMk9aWiIsImNvZ25pdG86dXNlcm5hbWUiOiJ0ZXN0Iiwib3JpZ2luX2p0aSI6IjczNWI4ODU3LTIwNmEtNDMyZS05OGNlLTM5Yjk5ZjhlYTdhMyIsImF1ZCI6IjNxcWEzZDA4bzZrbTh0dTA1MjNrbWFjYWVvIiwiZXZlbnRfaWQiOiIyYWU1ZjY4Yi04ZWMzLTRmNjEtODQzYy0zNmJhYzU5MjU4NjIiLCJ0b2tlbl91c2UiOiJpZCIsImF1dGhfdGltZSI6MTc2MTkxNDAwMSwiZXhwIjoxNzYxOTE3NjAxLCJpYXQiOjE3NjE5MTQwMDEsImp0aSI6ImZkOGY3OWIwLWI2ZTYtNDA1Yi1iZTBkLTQ4NzQzMTRiNzk5NCIsImVtYWlsIjoiYWhtZWQuc2FtZWgyMDAzQGdtYWlsLmNvbSJ9.PisCOwa5iBW6W13XHVhZPCn0ZEO_3NY3w87VwOUo1nMupXHrEZH99gMvjhvj0q4XiFAomNVAAIyyl3Wq8baS0KfZaJ8Qo9kB4fUK3HFz20NZHZPu2ZZytgJW32cfDSk76sTeOSpG0e_1FoOKX-54JX5R7UnGNexRZbfph7nOjJnPT9HfTHCZmEZCIwZOxwmEW94Jug5TL-hwHeRd-mzUS84LLSayZYXL3Vyw5-RV3YsnqGKoZ7bxl5tV_2EYs1nM1XK6dGu3-DitkmmhD3gqCmxh7-8GDeu08Hn70BeWxSu6qfu8Bo0ZIMs47uwL4AUWHQChx-8ok-7wR7U6WB9H_Q", "type": "string" },
+    { "key": "vendor_id", "value": "3", "type": "string" },
+    { "key": "product_id", "value": "2", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Profile - Create /users/me (POST)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{auth_token}}", "enabled": true }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"Test User\",\n  \"phone_number\": \"+2012345678904\",\n  \"default_delivery_address\": \"Block A - Gate 3\"\n}"
+        },
+        "url": { "raw": "{{base_url}}users/me", "host": ["{{base_url}}"], "path": ["users","me"] }
+      }
+    },
+    {
+      "name": "Profile - Get /users/me (GET)",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}", "enabled": true } ],
+        "url": { "raw": "{{base_url}}users/me", "host": ["{{base_url}}"], "path": ["users","me"] }
+      }
+    },
+    {
+      "name": "Products - Get /vendors/{id}/products (GET)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}vendors/{{vendor_id}}/products",
+          "host": ["{{base_url}}"],
+          "path": ["vendors","{{vendor_id}}","products"]
+        }
+      }
+    },
+    {
+      "name": "Orders - Create /orders (POST)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{auth_token}}", "enabled": true },
+          { "key": "Idempotency-Key", "value": "test-order-{{timestamp}}", "type": "text" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"vendor_id\": {{vendor_id}},\n  \"delivery_location\": \"Block A - Gate 3\",\n  \"items\": [\n    { \"product_id\": {{product_id}}, \"quantity\": 1 }\n  ]\n}"
+        },
+        "url": { "raw": "{{base_url}}orders", "host": ["{{base_url}}"], "path": ["orders"] }
+      }
+    },
+    {
+      "name": "Orders - List /orders (GET)",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}", "enabled": true } ],
+        "url": { "raw": "{{base_url}}orders", "host": ["{{base_url}}"], "path": ["orders"] }
+      }
+    },
+    {
+      "name": "Vendor Orders - /vendors/{id}/orders (GET)",
+      "request": {
+        "method": "GET",
+        "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}", "enabled": true } ],
+        "url": {
+          "raw": "{{base_url}}vendors/{{vendor_id}}/orders",
+          "host": ["{{base_url}}"],
+          "path": ["vendors","{{vendor_id}}","orders"]
+        }
+      }
+    }
+  ]
+}

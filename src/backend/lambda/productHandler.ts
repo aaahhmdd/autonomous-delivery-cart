@@ -1,8 +1,10 @@
+
+
 /**
  * This Lambda function handles all API requests related to products.
  * Specifically: GET /vendors/{id}/products
  * Version: Cost-$0 (No NAT, no Secrets Manager)
- */
+
 
 // --- SDK and Library Imports ---
 import { Client } from 'pg';
@@ -15,7 +17,7 @@ const { DB_HOST, DB_NAME, DB_USER, DB_PASSWORD } = process.env;
 
 /**
  * Main entry point for the Lambda function.
- */
+
 export async function handler(
   event: APIGatewayProxyEvent
 ): Promise<APIGatewayProxyResult> {
@@ -94,5 +96,53 @@ export async function handler(
       await client.end();
       console.log('Database connection closed');
     }
+  }
+}
+
+*/
+
+
+
+
+
+
+
+
+
+
+// lambda/productHandler.ts
+import { Client } from 'pg';
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { getPool } from './dbPool';
+
+export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  console.log('Event:', JSON.stringify(event, null, 2));
+  const pool = getPool();
+  const client = await pool.connect();
+  try {
+    const httpMethod = event.httpMethod;
+    if (httpMethod !== 'GET') {
+      return { statusCode: 405, body: JSON.stringify({ error: `Unsupported method: ${httpMethod}` }) };
+    }
+    const vendorId = event.pathParameters?.id;
+    if (!vendorId) {
+      return { statusCode: 400, body: JSON.stringify('Bad Request: Missing vendorId') };
+    }
+
+    const query = `
+      SELECT 
+        p.id, p.name, p.description, p.sku, p.image_url,
+        i.price, i.quantity_in_stock
+      FROM products p
+      JOIN inventories i ON p.id = i.product_id
+      WHERE i.vendor_id = $1;
+    `;
+    const res = await client.query(query, [vendorId]);
+    return { statusCode: 200, body: JSON.stringify(res.rows), headers: { 'Content-Type': 'application/json' } };
+  } catch (err) {
+    console.error('productHandler error', err);
+    return { statusCode: 500, body: JSON.stringify({ error: 'Internal Server Error', message: (err as Error).message }) };
+  } finally {
+    client.release();
   }
 }
