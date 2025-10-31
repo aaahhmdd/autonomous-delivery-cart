@@ -6,7 +6,7 @@
 
 // --- SDK and Library Imports ---
 import { Client } from 'pg';
-import { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 
 // --- Environment Variables ---
 // Directly use plaintext env vars (passed from CDK)
@@ -17,8 +17,8 @@ const { DB_HOST, DB_NAME, DB_USER, DB_PASSWORD } = process.env;
  * Main entry point for the Lambda function.
  */
 export async function handler(
-  event: APIGatewayProxyEventV2
-): Promise<APIGatewayProxyResultV2> {
+  event: APIGatewayProxyEvent
+): Promise<APIGatewayProxyResult> {
   console.log('Event:', JSON.stringify(event, null, 2));
 
   let client: Client | undefined;
@@ -37,7 +37,7 @@ export async function handler(
     await client.connect();
     console.log('Connected to database successfully');
 
-    const httpMethod = event.requestContext.http.method;
+    const httpMethod = event.httpMethod; // chatgpt fix
 
     // --- 2. Handle GET /vendors/{id}/products ---
     if (httpMethod === 'GET') {
