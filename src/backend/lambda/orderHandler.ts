@@ -233,27 +233,27 @@ export async function handler(
 
 
 
-
-
-// lambda/orderHandler.ts
+// **FIX 1: Remove `Client` import, add `getPool` import**
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { getPool } from './dbPool';
 
 type OrderItem = {
   product_id: number;
   quantity: number;
-  // client-sent price_at_purchase will be ignored and replaced by server computed price
 };
 
 export async function handler(
   event: APIGatewayProxyEvent
 ): Promise<APIGatewayProxyResult> {
   console.log('Event:', JSON.stringify(event, null, 2));
+  
+  // **FIX 2: Get the pool and connect a client**
   const pool = getPool();
   const client = await pool.connect();
+  console.log('Successfully connected client from pool');
 
   try {
-    // --- auth: Cognito sub
+    // --- auth: Cognito sub ---
     const cognitoUserId = event.requestContext.authorizer?.claims.sub;
     if (!cognitoUserId) {
       return { statusCode: 401, body: JSON.stringify('Unauthorized') };
@@ -262,11 +262,9 @@ export async function handler(
     const httpMethod = event.httpMethod;
     const path = event.path;
 
-    // --- GET /orders & GET /orders/{orderId} & vendor orders handled below (unchanged)
     if (httpMethod === 'POST' && path === '/orders') {
       const body = JSON.parse(event.body || '{}');
 
-      // Idempotency: prefer header, fallback to body
       const idempotencyKey =
         (event.headers && (event.headers['Idempotency-Key'] || event.headers['idempotency-key'])) ||
         body.idempotency_key ||
@@ -276,7 +274,6 @@ export async function handler(
       const delivery_location = body.delivery_location;
       const items = body.items as OrderItem[] | undefined;
 
-      // basic validation
       if (!vendor_id || !delivery_location || !items || !Array.isArray(items) || items.length === 0) {
         return {
           statusCode: 400,
@@ -284,14 +281,12 @@ export async function handler(
         };
       }
 
-      // find internal user id
       const userRes = await client.query('SELECT id, role FROM users WHERE cognito_id = $1', [cognitoUserId]);
       if (userRes.rows.length === 0) {
         return { statusCode: 404, body: JSON.stringify('User profile not found. Please complete profile.') };
       }
       const internalUserId = userRes.rows[0].id;
 
-      // --- Idempotency check
       if (idempotencyKey) {
         const existing = await client.query(
           'SELECT id, status, total_amount FROM orders WHERE idempotency_key = $1 AND customer_id = $2',
@@ -305,22 +300,17 @@ export async function handler(
         }
       }
 
-      // --- 1) Recompute total server-side using inventories prices
-      // gather product ids
+      // --- 1) Recompute total server-side ---
       const productIds = items.map((it) => Number(it.product_id));
-      // query inventory for those products for the given vendor
       const q = `
         SELECT product_id, price
         FROM inventories
         WHERE vendor_id = $1 AND product_id = ANY($2::int[])
       `;
       const invRes = await client.query(q, [vendor_id, productIds]);
-
-      // build map product_id -> price
       const priceMap = new Map<number, number>();
       invRes.rows.forEach((r: any) => priceMap.set(Number(r.product_id), Number(r.price)));
 
-      // compute total
       let computedTotal = 0;
       for (const it of items) {
         const pid = Number(it.product_id);
@@ -335,7 +325,7 @@ export async function handler(
         computedTotal += price * qty;
       }
 
-      // --- 2) Create order and items in transaction
+      // --- 2) Create order and items in transaction ---
       try {
         await client.query('BEGIN');
 
@@ -347,7 +337,6 @@ export async function handler(
         const orderRes = await client.query(orderInsert, [internalUserId, vendor_id, delivery_location, computedTotal, idempotencyKey]);
         const newOrderId = orderRes.rows[0].id;
 
-        // insert order items
         const insertItemText = `
           INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase)
           VALUES ($1, $2, $3, $4)
@@ -404,7 +393,6 @@ export async function handler(
 
     // --- GET /vendors/{id}/orders (vendor) ---
     if (httpMethod === 'GET' && path.startsWith('/vendors/') && path.endsWith('/orders')) {
-      // path param id
       const vendorIdFromPath = event.pathParameters?.id;
       const userRes = await client.query('SELECT id, role FROM users WHERE cognito_id = $1', [cognitoUserId]);
       if (userRes.rows.length === 0) {
@@ -424,6 +412,10 @@ export async function handler(
     console.error('Lambda handler error:', err);
     return { statusCode: 500, body: JSON.stringify({ error: 'Internal Server Error', message: (err as Error).message }) };
   } finally {
-    client.release();
+    // **FIX 3: Release client back to pool instead of ending it**
+    if (client) {
+      client.release();
+      console.log('Database client released back to pool');
+    }
   }
 }
