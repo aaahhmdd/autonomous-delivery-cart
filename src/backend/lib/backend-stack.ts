@@ -270,7 +270,7 @@ export class BackendStack extends cdk.Stack {
 
 
 
-
+// sprint 3
 
 import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
@@ -400,7 +400,7 @@ export class BackendStack extends cdk.Stack {
         version: rds.PostgresEngineVersion.VER_15,
       }),
       instanceType: ec2.InstanceType.of(
-        ec2.InstanceClass.T4G,
+        ec2.InstanceClass.T3,
         ec2.InstanceSize.MICRO
       ),
       //
@@ -434,7 +434,7 @@ export class BackendStack extends cdk.Stack {
         // **FIXED**: Changed from T2 (Intel) to T4G (Graviton)
         // This matches our database instance family, is also Free Tier,
         // and resolves the "configuration not supported" error.
-        ec2.InstanceClass.T4G,
+        ec2.InstanceClass.T3,
         ec2.InstanceSize.MICRO
       ),
       // This is the *only* thing we need to allow.
