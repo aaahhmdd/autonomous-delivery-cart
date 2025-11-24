@@ -1,0 +1,11 @@
+py -3.13 create_vendor.py
+
+
+3.  **Enter the Data**:
+* Username: market_compound_a
+* Password: StrongPassword123!
+* Name:     Vendor Supermarket A (**Must** have "Vendor")
+* Compound: Compound A
+
+py -3.13 delete_vendor.py
+
