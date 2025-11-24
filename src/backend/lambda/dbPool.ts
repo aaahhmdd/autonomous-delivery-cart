@@ -9,17 +9,16 @@ let pool: Pool | undefined;
  * This is crucial for performance in AWS Lambda.
  */
 export function getPool() {
-  if (!pool) {
-    console.log('No existing pool found. Initializing new pg Pool...');
-    
-    // Check for required environment variables
-    const requiredEnv = ['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME'];
-    for (const env of requiredEnv) {
-      if (!process.env[env]) {
-        console.error(`Missing required environment variable: ${env}`);
-        throw new Error(`Database configuration is incomplete. Missing: ${env}`);
-      }
-    }
+    if (!pool) {
+        console.log('No existing pool found. Initializing new pg Pool...');
+            // Check for required environment variables
+            const requiredEnv = ['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME'];
+            for (const env of requiredEnv) {
+                if (!process.env[env]) {
+                    console.error(`Missing required environment variable: ${env}`);
+                    throw new Error(`Database configuration is incomplete. Missing: ${env}`);
+                }
+            }
 
     pool = new Pool({
       host: process.env.DB_HOST,

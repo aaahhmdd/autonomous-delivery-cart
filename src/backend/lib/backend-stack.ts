@@ -268,7 +268,7 @@ export class BackendStack extends cdk.Stack {
 
 
 
-
+/*
 
 // sprint 3
 
@@ -631,12 +631,597 @@ export class BackendStack extends cdk.Stack {
   }
 }
 
+*/
+
+
+// sprint 4 - v1 
+
+/*
+
+
+import * as cdk from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as rds from 'aws-cdk-lib/aws-rds';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as lambdaNodejs from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
+import { aws_iam as iam } from 'aws-cdk-lib';
+import { RetentionDays } from 'aws-cdk-lib/aws-logs';
+
+// --- Constants ---
+const DB_PASSWORD = 'GradProjectPassword123!';
+const DB_NAME = 'deliverydb';
+const DB_USER = 'postgres';
+
+export class BackendStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    // =================================================================
+    // SPRINT 2: AUTHENTICATION (UNCHANGED)
+    // =================================================================
+
+    const userPool = new cognito.UserPool(this, 'DeliveryUserPool', {
+      userPoolName: 'delivery-user-pool',
+      selfSignUpEnabled: true,
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      userVerification: {
+        emailStyle: cognito.VerificationEmailStyle.CODE,
+      },
+      autoVerify: { email: true },
+      standardAttributes: {
+        email: { required: true, mutable: true },
+        phoneNumber: { required: false, mutable: true },
+      },
+      passwordPolicy: {
+        minLength: 8,
+        requireLowercase: true,
+        requireDigits: true,
+        requireSymbols: false,
+        requireUppercase: false,
+      },
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const userPoolClient = new cognito.UserPoolClient(
+      this,
+      'DeliveryUserPoolClient',
+      {
+        userPool,
+        authFlows: {
+          userSrp: true,
+        },
+        supportedIdentityProviders: [
+          cognito.UserPoolClientIdentityProvider.COGNITO,
+        ],
+      }
+    );
+
+    // =================================================================
+    // SPRINT 3: DATABASE & API (PRESERVED)
+    // =================================================================
+
+    // --- 3. Networking (VPC) ---
+    const vpc = new ec2.Vpc(this, 'DeliveryVPC', {
+      vpcName: 'delivery-vpc',
+      maxAzs: 2,
+      subnetConfiguration: [
+        {
+          cidrMask: 24,
+          name: 'public-subnet',
+          subnetType: ec2.SubnetType.PUBLIC,
+        },
+        {
+          cidrMask: 24,
+          name: 'private-subnet',
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+        },
+      ],
+      natGateways: 0,
+    });
+
+    // --- 4. Database Security Group ---
+    const dbSecurityGroup = new ec2.SecurityGroup(
+      this,
+      'DbSecurityGroup',
+      {
+        vpc,
+        description: 'Allow PostgreSQL inbound traffic from Lambda',
+        allowAllOutbound: true,
+      }
+    );
+
+    // --- 5. The RDS PostgreSQL Database ---
+    const dbInstance = new rds.DatabaseInstance(this, 'DeliveryDatabase', {
+      vpc: vpc,
+      vpcSubnets: {
+        subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+      },
+      securityGroups: [dbSecurityGroup],
+      engine: rds.DatabaseInstanceEngine.postgres({
+        version: rds.PostgresEngineVersion.VER_15,
+      }),
+      instanceType: ec2.InstanceType.of(
+        ec2.InstanceClass.T4G,
+        ec2.InstanceSize.MICRO
+      ),
+      databaseName: DB_NAME,
+      credentials: rds.Credentials.fromPassword(
+        DB_USER,
+        cdk.SecretValue.unsafePlainText(DB_PASSWORD)
+      ),
+      allocatedStorage: 20,
+      maxAllocatedStorage: 50,
+      multiAz: false,
+      publiclyAccessible: false,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // --- 6. Bastion Host ---
+    const bastion = new ec2.BastionHostLinux(this, 'BastionHost', {
+      vpc,
+      subnetSelection: { subnetType: ec2.SubnetType.PUBLIC },
+      instanceName: 'delivery-bastion',
+      instanceType: ec2.InstanceType.of(
+        ec2.InstanceClass.T4G,
+        ec2.InstanceSize.MICRO
+      ),
+      securityGroup: new ec2.SecurityGroup(this, 'BastionSecurityGroup', {
+        vpc,
+        description: 'Allow SSH/SSM access to Bastion',
+        allowAllOutbound: true,
+      }),
+    });
+
+    // Correct: Allow DB to receive traffic FROM Bastion
+    dbInstance.connections.allowFrom(
+      bastion,
+      ec2.Port.tcp(5432),
+      'Allow connection from Bastion host'
+    );
+
+    bastion.instance.role.addManagedPolicy(
+      iam.ManagedPolicy.fromAwsManagedPolicyName(
+        'AmazonSSMManagedInstanceCore'
+      )
+    );
+
+    // --- 7. Lambda Function Environment ---
+    const lambdaEnvironment = {
+      DB_HOST: dbInstance.dbInstanceEndpointAddress,
+      DB_PORT: dbInstance.dbInstanceEndpointPort,
+      DB_NAME: DB_NAME,
+      DB_USER: DB_USER,
+      DB_PASSWORD: DB_PASSWORD,
+    };
+
+    const lambdaCommonProps: Partial<lambdaNodejs.NodejsFunctionProps> = {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      handler: 'handler',
+      vpc: vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      environment: lambdaEnvironment,
+      timeout: cdk.Duration.seconds(10),
+      bundling: {
+        externalModules: ['aws-sdk', 'pg-native'],
+      },
+      logRetention: RetentionDays.ONE_WEEK,
+    };
+
+    // --- 8. Define ALL Lambda Functions ---
+    
+    // Existing Sprint 3 Lambdas
+    const orderLambda = new lambdaNodejs.NodejsFunction(
+      this,
+      'OrderHandler',
+      {
+        ...lambdaCommonProps,
+        functionName: 'order-handler',
+        entry: 'lambda/orderHandler.ts',
+      }
+    );
+
+    const profileLambda = new lambdaNodejs.NodejsFunction(
+      this,
+      'ProfileHandler',
+      {
+        ...lambdaCommonProps,
+        functionName: 'profile-handler',
+        entry: 'lambda/profileHandler.ts',
+      }
+    );
+
+    const productLambda = new lambdaNodejs.NodejsFunction(
+      this,
+      'ProductHandler',
+      {
+        ...lambdaCommonProps,
+        functionName: 'product-handler',
+        entry: 'lambda/productHandler.ts',
+      }
+    );
+
+    // *** SPRINT 4 ADDITION: New Inventory Handler ***
+    const inventoryLambda = new lambdaNodejs.NodejsFunction(
+      this,
+      'InventoryHandler',
+      {
+        ...lambdaCommonProps,
+        functionName: 'inventory-handler',
+        entry: 'lambda/inventoryHandler.ts',
+      }
+    );
+
+    // --- 9. Grant DB Access to Lambdas (CORRECTED DIRECTION) ---
+    // The Lambda initiates connection TO the DB.
+    
+    orderLambda.connections.allowTo(
+      dbInstance,
+      ec2.Port.tcp(5432),
+      'Allow Order Lambda to connect to DB'
+    );
+    
+    profileLambda.connections.allowTo(
+      dbInstance,
+      ec2.Port.tcp(5432),
+      'Allow Profile Lambda to connect to DB'
+    );
+    
+    productLambda.connections.allowTo(
+      dbInstance,
+      ec2.Port.tcp(5432),
+      'Allow Product Lambda to connect to DB'
+    );
+
+    // *** SPRINT 4 ADDITION: Grant access to new Lambda ***
+    inventoryLambda.connections.allowTo(
+      dbInstance,
+      ec2.Port.tcp(5432),
+      'Allow Inventory Lambda to connect to DB'
+    );
+
+    // --- 10. API Gateway (REST API) ---
+    const api = new apigateway.RestApi(this, 'DeliveryApi', {
+      restApiName: 'Delivery Service API',
+      description: 'API for the autonomous delivery cart system.',
+      deployOptions: {
+        stageName: 'prod',
+      },
+      defaultCorsPreflightOptions: {
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
+        allowMethods: apigateway.Cors.ALL_METHODS,
+        allowHeaders: [
+          'Content-Type',
+          'X-Amz-Date',
+          'Authorization',
+          'X-Api-Key',
+          'Idempotency-Key', 
+        ],
+      },
+    });
+
+    // --- 11. Cognito Authorizer for the API ---
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(
+      this,
+      'CognitoAuthorizer',
+      {
+        cognitoUserPools: [userPool],
+      }
+    );
+
+    const authMethodOptions = {
+      authorizer: authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    };
+
+    // --- 12. Define API Endpoints ---
+    
+    // Integrations
+    const orderIntegration = new apigateway.LambdaIntegration(orderLambda);
+    const profileIntegration = new apigateway.LambdaIntegration(profileLambda);
+    const productIntegration = new apigateway.LambdaIntegration(productLambda);
+    // *** SPRINT 4 ADDITION: Inventory Integration ***
+    const inventoryIntegration = new apigateway.LambdaIntegration(inventoryLambda);
+
+    // --- /orders ---
+    const ordersResource = api.root.addResource('orders');
+    ordersResource.addMethod('POST', orderIntegration, authMethodOptions); // POST /orders
+    ordersResource.addMethod('GET', orderIntegration, authMethodOptions); // GET /orders
+
+    // --- /orders/{orderId} ---
+    const orderIdResource = ordersResource.addResource('{orderId}');
+    orderIdResource.addMethod('GET', orderIntegration, authMethodOptions); // GET /orders/{orderId}
+
+    // *** SPRINT 4 ADDITION: PUT /orders/{orderId}/status ***
+    // Allows vendors to update order status
+    const orderStatusResource = orderIdResource.addResource('status');
+    orderStatusResource.addMethod('PUT', orderIntegration, authMethodOptions);
+
+    // --- /vendors/{id}/orders ---
+    const vendorsResource = api.root.addResource('vendors');
+    const vendorIdResource = vendorsResource.addResource('{id}');
+    const vendorOrdersResource = vendorIdResource.addResource('orders');
+    vendorOrdersResource.addMethod('GET', orderIntegration, authMethodOptions); // GET /vendors/{id}/orders
+
+    // --- /vendors/{id}/products ---
+    const vendorProductsResource = vendorIdResource.addResource('products');
+    vendorProductsResource.addMethod('GET', productIntegration); // GET /vendors/{id}/products (Public)
+
+    // --- /users/me ---
+    const usersResource = api.root.addResource('users');
+    const userMeResource = usersResource.addResource('me');
+    userMeResource.addMethod('GET', profileIntegration, authMethodOptions); // GET /users/me
+    userMeResource.addMethod('POST', profileIntegration, authMethodOptions); // POST /users/me
+
+    // *** SPRINT 4 ADDITION: /users/me/products (Vendor Inventory Mgmt) ***
+    const userMeProductsResource = userMeResource.addResource('products');
+    // GET: View own inventory
+    userMeProductsResource.addMethod('GET', inventoryIntegration, authMethodOptions);
+    // POST: Add new product
+    userMeProductsResource.addMethod('POST', inventoryIntegration, authMethodOptions);
+    
+    // PUT: Update product
+    const userMeProductIdResource = userMeProductsResource.addResource('{productId}');
+    userMeProductIdResource.addMethod('PUT', inventoryIntegration, authMethodOptions);
+
+    // =================================================================
+    // OUTPUTS (UNCHANGED)
+    // =================================================================
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: userPool.userPoolId,
+    });
+    new cdk.CfnOutput(this, 'UserPoolClientId', {
+      value: userPoolClient.userPoolClientId,
+    });
+    new cdk.CfnOutput(this, 'ApiGatewayUrl', {
+      value: api.url,
+    });
+    new cdk.CfnOutput(this, 'BastionHostId', {
+      value: bastion.instanceId,
+    });
+    new cdk.CfnOutput(this, 'DatabaseEndpoint', {
+      value: dbInstance.dbInstanceEndpointAddress,
+    });
+  }
+}
+
+*/
 
 
 
 
 
+// sprint 4 - v2 
 
 
+import * as cdk from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as rds from 'aws-cdk-lib/aws-rds';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as lambdaNodejs from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
+import { aws_iam as iam } from 'aws-cdk-lib';
+import { RetentionDays } from 'aws-cdk-lib/aws-logs';
 
+// --- Constants ---
+const DB_PASSWORD = 'GradProjectPassword123!';
+const DB_NAME = 'deliverydb';
+const DB_USER = 'postgres';
 
+export class BackendStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    // =================================================================
+    // AUTHENTICATION (Unchanged)
+    // =================================================================
+    const userPool = new cognito.UserPool(this, 'DeliveryUserPool', {
+      userPoolName: 'delivery-user-pool',
+      selfSignUpEnabled: true,
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      userVerification: { emailStyle: cognito.VerificationEmailStyle.CODE },
+      autoVerify: { email: true },
+      standardAttributes: {
+        email: { required: true, mutable: true },
+        phoneNumber: { required: false, mutable: true },
+      },
+      passwordPolicy: {
+        minLength: 8, requireLowercase: true, requireDigits: true, requireSymbols: false, requireUppercase: false,
+      },
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const userPoolClient = new cognito.UserPoolClient(this, 'DeliveryUserPoolClient', {
+      userPool,
+      authFlows: { userSrp: true,
+        userPassword: true,
+      },
+      supportedIdentityProviders: [cognito.UserPoolClientIdentityProvider.COGNITO],
+    });
+
+    // =================================================================
+    // INFRASTRUCTURE (VPC & RDS) (Unchanged)
+    // =================================================================
+    const vpc = new ec2.Vpc(this, 'DeliveryVPC', {
+      vpcName: 'delivery-vpc',
+      maxAzs: 2,
+      subnetConfiguration: [
+        { cidrMask: 24, name: 'public-subnet', subnetType: ec2.SubnetType.PUBLIC },
+        { cidrMask: 24, name: 'private-subnet', subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      ],
+      natGateways: 0,
+    });
+
+    const dbSecurityGroup = new ec2.SecurityGroup(this, 'DbSecurityGroup', {
+      vpc,
+      description: 'Allow PostgreSQL inbound traffic from Lambda',
+      allowAllOutbound: true,
+    });
+
+    const dbInstance = new rds.DatabaseInstance(this, 'DeliveryDatabase', {
+      vpc: vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      securityGroups: [dbSecurityGroup],
+      engine: rds.DatabaseInstanceEngine.postgres({ version: rds.PostgresEngineVersion.VER_15 }),
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
+      databaseName: DB_NAME,
+      credentials: rds.Credentials.fromPassword(DB_USER, cdk.SecretValue.unsafePlainText(DB_PASSWORD)),
+      allocatedStorage: 20,
+      maxAllocatedStorage: 50,
+      multiAz: false,
+      publiclyAccessible: false,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const bastion = new ec2.BastionHostLinux(this, 'BastionHost', {
+      vpc,
+      subnetSelection: { subnetType: ec2.SubnetType.PUBLIC },
+      instanceName: 'delivery-bastion',
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
+      securityGroup: new ec2.SecurityGroup(this, 'BastionSecurityGroup', {
+        vpc, description: 'Allow SSH/SSM access to Bastion', allowAllOutbound: true,
+      }),
+    });
+
+    dbInstance.connections.allowFrom(bastion, ec2.Port.tcp(5432), 'Allow connection from Bastion host');
+    bastion.instance.role.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'));
+
+    // =================================================================
+    // LAMBDA FUNCTIONS
+    // =================================================================
+    const lambdaEnvironment = {
+      DB_HOST: dbInstance.dbInstanceEndpointAddress,
+      DB_PORT: dbInstance.dbInstanceEndpointPort,
+      DB_NAME: DB_NAME,
+      DB_USER: DB_USER,
+      DB_PASSWORD: DB_PASSWORD,
+    };
+
+    const lambdaCommonProps: Partial<lambdaNodejs.NodejsFunctionProps> = {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      handler: 'handler',
+      vpc: vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      environment: lambdaEnvironment,
+      timeout: cdk.Duration.seconds(10),
+      bundling: { externalModules: ['aws-sdk', 'pg-native'] },
+      logRetention: RetentionDays.ONE_WEEK,
+    };
+
+    const orderLambda = new lambdaNodejs.NodejsFunction(this, 'OrderHandler', {
+      ...lambdaCommonProps,
+      functionName: 'order-handler',
+      entry: 'lambda/orderHandler.ts',
+    });
+
+    const profileLambda = new lambdaNodejs.NodejsFunction(this, 'ProfileHandler', {
+      ...lambdaCommonProps,
+      functionName: 'profile-handler',
+      entry: 'lambda/profileHandler.ts',
+    });
+
+    const productLambda = new lambdaNodejs.NodejsFunction(this, 'ProductHandler', {
+      ...lambdaCommonProps,
+      functionName: 'product-handler',
+      entry: 'lambda/productHandler.ts',
+    });
+
+    const inventoryLambda = new lambdaNodejs.NodejsFunction(this, 'InventoryHandler', {
+      ...lambdaCommonProps,
+      functionName: 'inventory-handler',
+      entry: 'lambda/inventoryHandler.ts',
+    });
+
+    // *** NEW: Analytics Handler ***
+    const analyticsLambda = new lambdaNodejs.NodejsFunction(this, 'AnalyticsHandler', {
+      ...lambdaCommonProps,
+      functionName: 'analytics-handler',
+      entry: 'lambda/analyticsHandler.ts',
+    });
+
+    // --- Grant Access ---
+    orderLambda.connections.allowTo(dbInstance, ec2.Port.tcp(5432), 'Order Lambda to DB');
+    profileLambda.connections.allowTo(dbInstance, ec2.Port.tcp(5432), 'Profile Lambda to DB');
+    productLambda.connections.allowTo(dbInstance, ec2.Port.tcp(5432), 'Product Lambda to DB');
+    inventoryLambda.connections.allowTo(dbInstance, ec2.Port.tcp(5432), 'Inventory Lambda to DB');
+    analyticsLambda.connections.allowTo(dbInstance, ec2.Port.tcp(5432), 'Analytics Lambda to DB');
+
+    // =================================================================
+    // API GATEWAY
+    // =================================================================
+    const api = new apigateway.RestApi(this, 'DeliveryApi', {
+      restApiName: 'Delivery Service API',
+      description: 'API for the autonomous delivery cart system.',
+      deployOptions: { stageName: 'prod' },
+      defaultCorsPreflightOptions: {
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
+        allowMethods: apigateway.Cors.ALL_METHODS,
+        allowHeaders: ['Content-Type', 'X-Amz-Date', 'Authorization', 'X-Api-Key', 'Idempotency-Key'],
+      },
+    });
+
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
+      cognitoUserPools: [userPool],
+    });
+    const authMethodOptions = {
+      authorizer: authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    };
+
+    // Integrations
+    const orderIntegration = new apigateway.LambdaIntegration(orderLambda);
+    const profileIntegration = new apigateway.LambdaIntegration(profileLambda);
+    const productIntegration = new apigateway.LambdaIntegration(productLambda);
+    const inventoryIntegration = new apigateway.LambdaIntegration(inventoryLambda);
+    const analyticsIntegration = new apigateway.LambdaIntegration(analyticsLambda);
+
+    // --- Routes ---
+
+    // /orders
+    const ordersResource = api.root.addResource('orders');
+    ordersResource.addMethod('POST', orderIntegration, authMethodOptions);
+    ordersResource.addMethod('GET', orderIntegration, authMethodOptions);
+
+    // /orders/{orderId}
+    const orderIdResource = ordersResource.addResource('{orderId}');
+    orderIdResource.addMethod('GET', orderIntegration, authMethodOptions);
+    orderIdResource.addResource('status').addMethod('PUT', orderIntegration, authMethodOptions);
+
+    // /vendors
+    const vendorsResource = api.root.addResource('vendors');
+    // NEW: GET /vendors (List vendors by compound) - Public
+    vendorsResource.addMethod('GET', productIntegration);
+
+    // /vendors/{id}/orders
+    const vendorIdResource = vendorsResource.addResource('{id}');
+    vendorIdResource.addResource('orders').addMethod('GET', orderIntegration, authMethodOptions);
+    // /vendors/{id}/products
+    vendorIdResource.addResource('products').addMethod('GET', productIntegration);
+
+    // /users/me
+    const usersResource = api.root.addResource('users');
+    const userMeResource = usersResource.addResource('me');
+    userMeResource.addMethod('GET', profileIntegration, authMethodOptions);
+    userMeResource.addMethod('POST', profileIntegration, authMethodOptions);
+    
+    // /users/me/products
+    const userMeProductsResource = userMeResource.addResource('products');
+    userMeProductsResource.addMethod('GET', inventoryIntegration, authMethodOptions);
+    userMeProductsResource.addMethod('POST', inventoryIntegration, authMethodOptions);
+    userMeProductsResource.addResource('{productId}').addMethod('PUT', inventoryIntegration, authMethodOptions);
+
+    // NEW: /users/me/analytics
+    userMeResource.addResource('analytics').addMethod('GET', analyticsIntegration, authMethodOptions);
+
+    // Outputs
+    new cdk.CfnOutput(this, 'UserPoolId', { value: userPool.userPoolId });
+    new cdk.CfnOutput(this, 'UserPoolClientId', { value: userPoolClient.userPoolClientId });
+    new cdk.CfnOutput(this, 'ApiGatewayUrl', { value: api.url });
+    new cdk.CfnOutput(this, 'BastionHostId', { value: bastion.instanceId });
+    new cdk.CfnOutput(this, 'DatabaseEndpoint', { value: dbInstance.dbInstanceEndpointAddress });
+  }
+}
