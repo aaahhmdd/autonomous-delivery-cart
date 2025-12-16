@@ -1,0 +1,5 @@
+{
+  "endpoint": "ajelyhc78s5bv-ats.iot.me-south-1.amazonaws.com",
+  "cart_id": "cart_001",
+  "topic": "carts/cart_001/telemetry"
+}
