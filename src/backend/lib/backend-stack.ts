@@ -1522,7 +1522,7 @@ export class BackendStack extends cdk.Stack {
 
 // Sprint 5 - v2
 
-
+/*
 
 import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
@@ -1900,6 +1900,411 @@ export class BackendStack extends cdk.Stack {
       value: dbInstance.dbInstanceEndpointAddress,
     });
     // New Output for Sprint 5
+    new cdk.CfnOutput(this, 'TelemetryTableName', {
+      value: telemetryTable.tableName,
+    });
+  }
+}
+
+*/
+
+
+// sprint 6
+
+
+import * as cdk from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as rds from 'aws-cdk-lib/aws-rds';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as lambdaNodejs from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb'; 
+import * as iot from 'aws-cdk-lib/aws-iot';           
+import { aws_iam as iam } from 'aws-cdk-lib';
+import { RetentionDays } from 'aws-cdk-lib/aws-logs';
+
+// --- Constants ---
+const DB_PASSWORD = 'GradProjectPassword123!';
+const DB_NAME = 'deliverydb';
+const DB_USER = 'postgres';
+
+export class BackendStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    // =================================================================
+    // SPRINT 2: AUTHENTICATION (UNCHANGED)
+    // =================================================================
+    const userPool = new cognito.UserPool(this, 'DeliveryUserPool', {
+      userPoolName: 'delivery-user-pool',
+      selfSignUpEnabled: true,
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      userVerification: {
+        emailStyle: cognito.VerificationEmailStyle.CODE,
+      },
+      autoVerify: { email: true },
+      standardAttributes: {
+        email: { required: true, mutable: true },
+        phoneNumber: { required: false, mutable: true },
+      },
+      passwordPolicy: {
+        minLength: 8,
+        requireLowercase: true,
+        requireDigits: true,
+        requireSymbols: false,
+        requireUppercase: false,
+      },
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const userPoolClient = new cognito.UserPoolClient(
+      this,
+      'DeliveryUserPoolClient',
+      {
+        userPool,
+        authFlows: {
+          userSrp: true,
+          userPassword: true, // Required for your Python Admin Tool
+        },
+        supportedIdentityProviders: [
+          cognito.UserPoolClientIdentityProvider.COGNITO,
+        ],
+      }
+    );
+
+    // =================================================================
+    // SPRINT 3: INFRASTRUCTURE (VPC & RDS) (UNCHANGED)
+    // =================================================================
+    const vpc = new ec2.Vpc(this, 'DeliveryVPC', {
+      vpcName: 'delivery-vpc',
+      maxAzs: 2,
+      subnetConfiguration: [
+        {
+          cidrMask: 24,
+          name: 'public-subnet',
+          subnetType: ec2.SubnetType.PUBLIC,
+        },
+        {
+          cidrMask: 24,
+          name: 'private-subnet',
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+        },
+      ],
+      natGateways: 0,
+    });
+
+    const dbSecurityGroup = new ec2.SecurityGroup(
+      this,
+      'DbSecurityGroup',
+      {
+        vpc,
+        description: 'Allow PostgreSQL inbound traffic from Lambda',
+        allowAllOutbound: true,
+      }
+    );
+
+    const dbInstance = new rds.DatabaseInstance(this, 'DeliveryDatabase', {
+      vpc: vpc,
+      vpcSubnets: {
+        subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+      },
+      securityGroups: [dbSecurityGroup],
+      engine: rds.DatabaseInstanceEngine.postgres({
+        version: rds.PostgresEngineVersion.VER_15,
+      }),
+      instanceType: ec2.InstanceType.of(
+        ec2.InstanceClass.T3,
+        ec2.InstanceSize.MICRO
+      ),
+      databaseName: DB_NAME,
+      credentials: rds.Credentials.fromPassword(
+        DB_USER,
+        cdk.SecretValue.unsafePlainText(DB_PASSWORD)
+      ),
+      allocatedStorage: 20,
+      maxAllocatedStorage: 50,
+      multiAz: false,
+      publiclyAccessible: false,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const bastion = new ec2.BastionHostLinux(this, 'BastionHost', {
+      vpc,
+      subnetSelection: { subnetType: ec2.SubnetType.PUBLIC },
+      instanceName: 'delivery-bastion',
+      instanceType: ec2.InstanceType.of(
+        ec2.InstanceClass.T3,
+        ec2.InstanceSize.MICRO
+      ),
+      securityGroup: new ec2.SecurityGroup(this, 'BastionSecurityGroup', {
+        vpc,
+        description: 'Allow SSH/SSM access to Bastion',
+        allowAllOutbound: true,
+      }),
+    });
+
+    dbInstance.connections.allowFrom(
+      bastion,
+      ec2.Port.tcp(5432),
+      'Allow connection from Bastion host'
+    );
+
+    bastion.instance.role.addManagedPolicy(
+      iam.ManagedPolicy.fromAwsManagedPolicyName(
+        'AmazonSSMManagedInstanceCore'
+      )
+    );
+
+    // --- 7. Lambda Function Environment ---
+    const lambdaEnvironment = {
+      DB_HOST: dbInstance.dbInstanceEndpointAddress,
+      DB_PORT: dbInstance.dbInstanceEndpointPort,
+      DB_NAME: DB_NAME,
+      DB_USER: DB_USER,
+      DB_PASSWORD: DB_PASSWORD,
+    };
+
+    const lambdaCommonProps: Partial<lambdaNodejs.NodejsFunctionProps> = {
+      runtime: lambda.Runtime.NODEJS_22_X, // Successfully upgraded to 22.x!
+      handler: 'handler',
+      vpc: vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      environment: lambdaEnvironment,
+      timeout: cdk.Duration.seconds(10),
+      bundling: {
+        externalModules: ['aws-sdk', 'pg-native'],
+      },
+      logRetention: RetentionDays.ONE_WEEK,
+    };
+
+    // --- 8. Define ALL Lambda Functions (Sprint 3 & 4) ---
+    
+    const orderLambda = new lambdaNodejs.NodejsFunction(
+      this,
+      'OrderHandler',
+      {
+        ...lambdaCommonProps,
+        functionName: 'order-handler',
+        entry: 'lambda/orderHandler.ts',
+      }
+    );
+
+    const profileLambda = new lambdaNodejs.NodejsFunction(
+      this,
+      'ProfileHandler',
+      {
+        ...lambdaCommonProps,
+        functionName: 'profile-handler',
+        entry: 'lambda/profileHandler.ts',
+      }
+    );
+
+    const productLambda = new lambdaNodejs.NodejsFunction(
+      this,
+      'ProductHandler',
+      {
+        ...lambdaCommonProps,
+        functionName: 'product-handler',
+        entry: 'lambda/productHandler.ts',
+      }
+    );
+
+    const inventoryLambda = new lambdaNodejs.NodejsFunction(
+      this,
+      'InventoryHandler',
+      {
+        ...lambdaCommonProps,
+        functionName: 'inventory-handler',
+        entry: 'lambda/inventoryHandler.ts',
+      }
+    );
+
+    const analyticsLambda = new lambdaNodejs.NodejsFunction(
+      this,
+      'AnalyticsHandler',
+      {
+        ...lambdaCommonProps,
+        functionName: 'analytics-handler',
+        entry: 'lambda/analyticsHandler.ts',
+      }
+    );
+
+    // --- 9. Grant DB Access ---
+    orderLambda.connections.allowTo(dbInstance, ec2.Port.tcp(5432), 'Order Lambda to DB');
+    profileLambda.connections.allowTo(dbInstance, ec2.Port.tcp(5432), 'Profile Lambda to DB');
+    productLambda.connections.allowTo(dbInstance, ec2.Port.tcp(5432), 'Product Lambda to DB');
+    inventoryLambda.connections.allowTo(dbInstance, ec2.Port.tcp(5432), 'Inventory Lambda to DB');
+    analyticsLambda.connections.allowTo(dbInstance, ec2.Port.tcp(5432), 'Analytics Lambda to DB');
+
+    // =================================================================
+    // API GATEWAY (Unchanged)
+    // =================================================================
+    const api = new apigateway.RestApi(this, 'DeliveryApi', {
+      restApiName: 'Delivery Service API',
+      description: 'API for the autonomous delivery cart system.',
+      deployOptions: { stageName: 'prod' },
+      defaultCorsPreflightOptions: {
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
+        allowMethods: apigateway.Cors.ALL_METHODS,
+        allowHeaders: [
+          'Content-Type',
+          'X-Amz-Date',
+          'Authorization',
+          'X-Api-Key',
+          'Idempotency-Key', 
+        ],
+      },
+    });
+
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(
+      this,
+      'CognitoAuthorizer',
+      {
+        cognitoUserPools: [userPool],
+      }
+    );
+
+    const authMethodOptions = {
+      authorizer: authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    };
+
+    // Integrations
+    const orderIntegration = new apigateway.LambdaIntegration(orderLambda);
+    const profileIntegration = new apigateway.LambdaIntegration(profileLambda);
+    const productIntegration = new apigateway.LambdaIntegration(productLambda);
+    const inventoryIntegration = new apigateway.LambdaIntegration(inventoryLambda);
+    const analyticsIntegration = new apigateway.LambdaIntegration(analyticsLambda);
+
+    // --- Routes (Sprint 3 & 4) ---
+
+    // /orders
+    const ordersResource = api.root.addResource('orders');
+    ordersResource.addMethod('POST', orderIntegration, authMethodOptions);
+    ordersResource.addMethod('GET', orderIntegration, authMethodOptions);
+
+    // /orders/{orderId}
+    const orderIdResource = ordersResource.addResource('{orderId}');
+    orderIdResource.addMethod('GET', orderIntegration, authMethodOptions);
+    orderIdResource.addResource('status').addMethod('PUT', orderIntegration, authMethodOptions);
+
+    // /vendors
+    const vendorsResource = api.root.addResource('vendors');
+    vendorsResource.addMethod('GET', productIntegration); // GET /vendors (Public)
+
+    // /vendors/{id}/...
+    const vendorIdResource = vendorsResource.addResource('{id}');
+    vendorIdResource.addResource('orders').addMethod('GET', orderIntegration, authMethodOptions);
+    vendorIdResource.addResource('products').addMethod('GET', productIntegration);
+
+    // /users/me
+    const usersResource = api.root.addResource('users');
+    const userMeResource = usersResource.addResource('me');
+    userMeResource.addMethod('GET', profileIntegration, authMethodOptions);
+    userMeResource.addMethod('POST', profileIntegration, authMethodOptions);
+    
+    // /users/me/products
+    const userMeProductsResource = userMeResource.addResource('products');
+    userMeProductsResource.addMethod('GET', inventoryIntegration, authMethodOptions);
+    userMeProductsResource.addMethod('POST', inventoryIntegration, authMethodOptions);
+    userMeProductsResource.addResource('{productId}').addMethod('PUT', inventoryIntegration, authMethodOptions);
+
+    // /users/me/analytics
+    userMeResource.addResource('analytics').addMethod('GET', analyticsIntegration, authMethodOptions);
+
+    // =================================================================
+    // SPRINT 5 & 6: IOT, TELEMETRY, & TRACKING
+    // =================================================================
+
+    // 1. DynamoDB Table for Real-Time Cart Telemetry
+    const telemetryTable = new dynamodb.Table(this, 'CartTelemetryTable', {
+      tableName: 'CartTelemetry',
+      partitionKey: { name: 'cart_id', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'timestamp', type: dynamodb.AttributeType.NUMBER },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // 2. Ingestion Lambda (Receives MQTT -> Writes to DynamoDB)
+    const telemetryLambda = new lambdaNodejs.NodejsFunction(this, 'TelemetryHandler', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'handler',
+      entry: 'lambda/telemetryHandler.ts',
+      environment: {
+        TELEMETRY_TABLE_NAME: telemetryTable.tableName,
+      },
+    });
+
+    telemetryTable.grantWriteData(telemetryLambda);
+
+    // 3. IoT Topic Rule
+    const telemetryRule = new iot.CfnTopicRule(this, 'TelemetryRule', {
+      ruleName: 'CartTelemetryIngestion',
+      topicRulePayload: {
+        sql: "SELECT * FROM 'carts/+/telemetry'",
+        actions: [
+          {
+            lambda: {
+              functionArn: telemetryLambda.functionArn,
+            },
+          },
+        ],
+        ruleDisabled: false,
+      },
+    });
+
+    telemetryLambda.addPermission('IoTPermission', {
+      principal: new iam.ServicePrincipal('iot.amazonaws.com'),
+      sourceArn: telemetryRule.attrArn,
+    });
+
+    // --- SPRINT 6: NEW FEATURES ADDED BELOW ---
+
+    // 4. Tracking Lambda (Reads from DynamoDB for Mobile App map)
+    const trackingLambda = new lambdaNodejs.NodejsFunction(this, 'TrackingHandler', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'handler',
+      entry: 'lambda/trackingHandler.ts',
+      environment: {
+        TELEMETRY_TABLE_NAME: telemetryTable.tableName,
+      },
+    });
+
+    telemetryTable.grantReadData(trackingLambda);
+
+    // 5. Tracking API Route: GET /carts/{cartId}/location
+    const trackingIntegration = new apigateway.LambdaIntegration(trackingLambda);
+    const cartsResource = api.root.addResource('carts');
+    const cartIdRoute = cartsResource.addResource('{cartId}');
+    const locationRoute = cartIdRoute.addResource('location');
+    locationRoute.addMethod('GET', trackingIntegration, authMethodOptions);
+
+    // 6. SNS Permissions for Order Handler
+    orderLambda.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['sns:Publish'],
+      resources: ['*'], // Allowing direct SMS publishing
+    }));
+
+    // =================================================================
+    // OUTPUTS
+    // =================================================================
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: userPool.userPoolId,
+    });
+    new cdk.CfnOutput(this, 'UserPoolClientId', {
+      value: userPoolClient.userPoolClientId,
+    });
+    new cdk.CfnOutput(this, 'ApiGatewayUrl', {
+      value: api.url,
+    });
+    new cdk.CfnOutput(this, 'BastionHostId', {
+      value: bastion.instanceId,
+    });
+    new cdk.CfnOutput(this, 'DatabaseEndpoint', {
+      value: dbInstance.dbInstanceEndpointAddress,
+    });
     new cdk.CfnOutput(this, 'TelemetryTableName', {
       value: telemetryTable.tableName,
     });

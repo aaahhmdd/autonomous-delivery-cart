@@ -878,7 +878,7 @@ export async function handler(
 
 // sprint 4 - v2
 
-
+/*
 
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { getPool } from './dbPool';
@@ -1147,6 +1147,199 @@ export async function handler(
     if (error.message.includes('not found')) {
         return { statusCode: 404, headers, body: JSON.stringify(error.message) };
     }
+    return { statusCode: 500, headers, body: JSON.stringify({ error: 'Internal Server Error', message: (err as Error).message }) };
+  } finally {
+    client.release();
+  }
+}
+
+*/
+
+// sprint 6
+
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { getPool } from './dbPool';
+import { PoolClient } from 'pg';
+import { SNSClient, PublishCommand } from "@aws-sdk/client-sns";
+
+const snsClient = new SNSClient({});
+
+const headers = { 
+  'Content-Type': 'application/json',
+  'Access-Control-Allow-Origin': '*', 
+  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET,PUT,DELETE',
+  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Idempotency-Key',
+};
+
+type OrderItem = { product_id: number; quantity: number; };
+
+async function authorizeVendor(client: PoolClient, cognitoUserId: string, vendorIdFromPath: string | undefined): Promise<number> {
+    const userRes = await client.query('SELECT id, role FROM users WHERE cognito_id = $1', [cognitoUserId]);
+    if (userRes.rows.length === 0) throw new Error('User profile not found');
+    if (userRes.rows[0].role !== 'vendor') throw new Error('Forbidden: User is not a vendor');
+    if (userRes.rows[0].id.toString() !== vendorIdFromPath) throw new Error('Forbidden: Vendor ID mismatch');
+    return userRes.rows[0].id;
+}
+
+export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  const pool = getPool();
+  const client = await pool.connect();
+
+  try {
+    const cognitoUserId = event.requestContext.authorizer?.claims.sub;
+    if (!cognitoUserId) return { statusCode: 401, headers, body: JSON.stringify('Unauthorized') };
+
+    const httpMethod = event.httpMethod;
+    const path = event.path;
+
+    // --- POST /orders (Customer creates order) ---
+    if (httpMethod === 'POST' && path === '/orders') {
+      const body = JSON.parse(event.body || '{}');
+      const idempotencyKey = (event.headers && (event.headers['Idempotency-Key'] || event.headers['idempotency-key'])) || body.idempotency_key || null;
+      const { vendor_id, delivery_location, items } = body as { vendor_id: number, delivery_location: string, items: OrderItem[] | undefined };
+
+      if (!vendor_id || !delivery_location || !items || items.length === 0) {
+        return { statusCode: 400, headers, body: JSON.stringify('Bad Request: Missing fields')};
+      }
+      
+      const userRes = await client.query('SELECT id, phone_number, name FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      if (userRes.rows.length === 0) return { statusCode: 404, headers, body: JSON.stringify('User profile not found') };
+      
+      const internalUserId = userRes.rows[0].id;
+      const userPhone = userRes.rows[0].phone_number;
+      const userName = userRes.rows[0].name;
+
+      if (idempotencyKey) {
+        const existing = await client.query('SELECT id, status, total_amount FROM orders WHERE idempotency_key = $1 AND customer_id = $2', [idempotencyKey, internalUserId]);
+        if (existing.rows.length > 0) return { statusCode: 200, headers, body: JSON.stringify(existing.rows[0]) };
+      }
+
+      const productIds = items.map((it) => Number(it.product_id));
+      const invRes = await client.query('SELECT product_id, price, quantity_in_stock FROM inventories WHERE vendor_id = $1 AND product_id = ANY($2::int[])', [vendor_id, productIds]);
+      
+      const priceMap = new Map<number, number>();
+      const stockMap = new Map<number, number>();
+      invRes.rows.forEach(r => {
+          priceMap.set(Number(r.product_id), Number(r.price));
+          stockMap.set(Number(r.product_id), Number(r.quantity_in_stock));
+      });
+
+      let computedTotal = 0;
+      for (const it of items) {
+        const pid = Number(it.product_id);
+        const qty = Number(it.quantity);
+        const price = priceMap.get(pid);
+        const stock = stockMap.get(pid);
+
+        if (price === undefined) return { statusCode: 400, headers, body: JSON.stringify(`Product ${pid} not found`) };
+        if (stock === undefined || stock < qty) return { statusCode: 409, headers, body: JSON.stringify(`Conflict: Not enough stock for product ${pid}. Available: ${stock}`) };
+        
+        computedTotal += price * qty;
+      }
+
+      try {
+        await client.query('BEGIN');
+        const orderInsert = `INSERT INTO orders (customer_id, vendor_id, status, delivery_location, total_amount, idempotency_key) VALUES ($1, $2, 'pending', $3, $4, $5) RETURNING id;`;
+        const orderRes = await client.query(orderInsert, [internalUserId, vendor_id, delivery_location, computedTotal, idempotencyKey]);
+        const newOrderId = orderRes.rows[0].id;
+
+        const insertItemText = 'INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase) VALUES ($1, $2, $3, $4)';
+        const updateStockText = 'UPDATE inventories SET quantity_in_stock = quantity_in_stock - $1 WHERE vendor_id = $2 AND product_id = $3';
+
+        for (const it of items) {
+          const pid = Number(it.product_id);
+          const qty = Number(it.quantity);
+          await client.query(insertItemText, [newOrderId, pid, qty, priceMap.get(pid)!]);
+          await client.query(updateStockText, [qty, vendor_id, pid]);
+        }
+        await client.query('COMMIT');
+
+        // === SPRINT 6: SEND SNS SMS NOTIFICATION ===
+        if (userPhone) {
+          try {
+            const message = `Hi ${userName}, your CARTA order #${newOrderId} has been placed successfully for $${computedTotal}!`;
+            await snsClient.send(new PublishCommand({
+              Message: message,
+              PhoneNumber: userPhone
+            }));
+            console.log("SNS SMS Sent successfully to:", userPhone);
+          } catch (snsErr) {
+            console.error("Failed to send SNS SMS. Proceeding anyway.", snsErr);
+            // We don't fail the order if the SMS fails
+          }
+        }
+
+        return { statusCode: 201, headers, body: JSON.stringify({ orderId: newOrderId, total_amount: computedTotal }) };
+      } catch (txErr) {
+        await client.query('ROLLBACK');
+        return { statusCode: 500, headers, body: JSON.stringify('Internal Server Error during order creation') };
+      }
+    }
+
+    // --- GET /orders (Customer list) ---
+    if (httpMethod === 'GET' && path === '/orders') {
+      const userRes = await client.query('SELECT id FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      const res = await client.query('SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC', [userRes.rows[0].id]);
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows) };
+    }
+
+    // --- GET /orders/{orderId} ---
+    if (httpMethod === 'GET' && event.pathParameters?.orderId) {
+      const orderId = event.pathParameters.orderId;
+      const userRes = await client.query('SELECT id FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      const orderRes = await client.query('SELECT * FROM orders WHERE id = $1 AND customer_id = $2', [orderId, userRes.rows[0].id]);
+      if (orderRes.rows.length === 0) return { statusCode: 404, headers, body: JSON.stringify('Order not found') };
+      
+      const itemsRes = await client.query(
+        `SELECT oi.*, p.name as product_name, p.image_url as product_image_url FROM order_items oi JOIN products p ON oi.product_id = p.id WHERE oi.order_id = $1`,
+        [orderId]
+      );
+      const detailed = orderRes.rows[0];
+      detailed.items = itemsRes.rows;
+      return { statusCode: 200, headers, body: JSON.stringify(detailed) };
+    }
+
+    // --- GET /vendors/{id}/orders ---
+    if (httpMethod === 'GET' && path.startsWith('/vendors/') && path.endsWith('/orders')) {
+      const internalUserId = await authorizeVendor(client, cognitoUserId, event.pathParameters?.id);
+      const res = await client.query('SELECT * FROM orders WHERE vendor_id = $1 ORDER BY created_at DESC', [internalUserId]);
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows) };
+    }
+    
+    // --- PUT /orders/{orderId}/status ---
+    if (httpMethod === 'PUT' && event.pathParameters?.orderId && path.endsWith('/status')) {
+      const { status } = JSON.parse(event.body || '{}');
+      
+      const allowedStatus = ['pending', 'preparing', 'ready_for_pickup', 'out_for_delivery', 'delivered', 'cancelled', 'returned'];
+      if (!status || !allowedStatus.includes(status)) {
+         return { statusCode: 400, headers, body: JSON.stringify(`Bad Request: Invalid status.`) };
+      }
+
+      const userRes = await client.query('SELECT id, role FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      if (userRes.rows[0].role !== 'vendor') return { statusCode: 403, headers, body: JSON.stringify('Forbidden') };
+
+      const updateQuery = `
+        UPDATE orders SET status = $1::order_status, updated_at = NOW(),
+        dispatched_at = CASE WHEN $1::text = 'out_for_delivery' THEN NOW() ELSE dispatched_at END,
+        completed_at = CASE WHEN $1::text = 'delivered' THEN NOW() ELSE completed_at END
+        WHERE id = $2 AND vendor_id = $3 RETURNING *;
+      `;
+      const res = await client.query(updateQuery, [status, event.pathParameters.orderId, userRes.rows[0].id]);
+      
+      // OPTIONAL SPRINT 6: Send SMS when status is out_for_delivery
+      if (status === 'out_for_delivery') {
+         // You can add another SNS PublishCommand here using the customer's phone number!
+      }
+
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows[0]) };
+    }
+
+    return { statusCode: 405, headers, body: JSON.stringify('Method Not Allowed') };
+  } catch (err) {
+    console.error('Order error:', err);
+    const error = err as Error;
+    if (error.message.includes('Forbidden')) return { statusCode: 403, headers, body: JSON.stringify(error.message) };
+    if (error.message.includes('not found')) return { statusCode: 404, headers, body: JSON.stringify(error.message) };
     return { statusCode: 500, headers, body: JSON.stringify({ error: 'Internal Server Error', message: (err as Error).message }) };
   } finally {
     client.release();
