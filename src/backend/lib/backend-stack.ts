@@ -1679,7 +1679,7 @@ export class BackendStack extends cdk.Stack {
     };
 
     const lambdaCommonProps: Partial<lambdaNodejs.NodejsFunctionProps> = {
-      runtime: lambda.Runtime.NODEJS_20_X,
+      runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'handler',
       vpc: vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
@@ -1845,7 +1845,7 @@ export class BackendStack extends cdk.Stack {
     // 2. Ingestion Lambda
     // Receives MQTT message -> Writes to DynamoDB
     const telemetryLambda = new lambdaNodejs.NodejsFunction(this, 'TelemetryHandler', {
-      runtime: lambda.Runtime.NODEJS_20_X,
+      runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'handler',
       entry: 'lambda/telemetryHandler.ts',
       environment: {
