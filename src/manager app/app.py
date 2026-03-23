@@ -2,6 +2,7 @@ import streamlit as st
 import boto3
 import pandas as pd
 import psycopg2
+import requests  # NEW: Required for sending API commands to the cart
 from botocore.exceptions import ClientError
 import config # Ensure you have your config.py with RDS and Cognito details
 
@@ -155,3 +156,54 @@ else:
         st.dataframe(active_df, use_container_width=True, hide_index=True)
     else:
         st.success("All clear! No pending or active deliveries right now.")
+
+    st.divider()
+    
+    # ==========================================
+    # SPRINT 8: COMMAND & CONTROL PANEL
+    # ==========================================
+    st.header("🎮 Remote Command & Control")
+    st.markdown("Override autonomous systems and send direct hardware commands to the fleet.")
+    
+    cmd_col1, cmd_col2 = st.columns(2)
+    
+    with cmd_col1:
+        st.subheader("Target Cart")
+        # In a real app, this would be a dropdown of active carts from DB
+        target_cart = st.text_input("Cart ID", value="cart_001")
+        
+    with cmd_col2:
+        st.subheader("Hardware Actions")
+        if st.button("🔓 Unlock Cart Doors", type="primary"):
+            # Call our new API endpoint!
+            headers = {
+                'Authorization': st.session_state['admin_token'],
+                'Content-Type': 'application/json'
+            }
+            payload = {"action": "unlock"}
+            
+            try:
+                res = requests.post(f"{config.API_BASE_URL}/carts/{target_cart}/command", json=payload, headers=headers)
+                if res.status_code == 200:
+                    st.toast('Command sent successfully!', icon='✅')
+                    st.success(f"Unlock command dispatched to {target_cart} via AWS IoT Core.")
+                else:
+                    st.error(f"Failed to send command: {res.text}")
+            except Exception as e:
+                st.error(f"API Connection Error: {e}")
+
+        if st.button("🛑 EMERGENCY STOP", type="secondary"):
+            # Call our new API endpoint with emergency action!
+            headers = {
+                'Authorization': st.session_state['admin_token'],
+                'Content-Type': 'application/json'
+            }
+            payload = {"action": "emergency_stop"}
+            try:
+                res = requests.post(f"{config.API_BASE_URL}/carts/{target_cart}/command", json=payload, headers=headers)
+                if res.status_code == 200:
+                    st.error(f"EMERGENCY STOP dispatched to {target_cart}!")
+                else:
+                    st.error(f"Failed to send command: {res.text}")
+            except Exception as e:
+                st.error(f"API Connection Error: {e}")

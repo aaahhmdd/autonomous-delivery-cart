@@ -2685,10 +2685,10 @@ export class BackendStack extends cdk.Stack {
     const locationRoute = cartIdRoute.addResource('location');
     locationRoute.addMethod('GET', trackingIntegration, authMethodOptions);
 
-    // 6. SNS Permissions for Order Handler
+    // 6. SES Permissions for Order Handler (Replacing SNS)
     orderLambda.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['sns:Publish'],
-      resources: ['*'], // Allowing direct SMS publishing
+      actions: ['ses:SendEmail'],
+      resources: ['*'], 
     }));
 
     // =================================================================
