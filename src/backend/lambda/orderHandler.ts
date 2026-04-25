@@ -1347,7 +1347,7 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
   }
 }
 
-*/
+/*
 
 // sprint 8
 
@@ -1573,5 +1573,464 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     return { statusCode: 500, headers, body: JSON.stringify({ error: 'Internal Server Error', message: (err as Error).message }) };
   } finally {
     client.release();
+  }
+}
+
+
+// 
+/*
+
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { getPool } from './dbPool';
+import { PoolClient } from 'pg';
+import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
+
+const sesClient = new SESClient({});
+// ⚠️ IMPORTANT: Replace with your verified email
+const SENDER_EMAIL = process.env.SENDER_EMAIL || 'your-email@gmail.com'; 
+
+const headers = { 
+  'Content-Type': 'application/json',
+  'Access-Control-Allow-Origin': '*', 
+  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET,PUT,DELETE',
+  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Idempotency-Key',
+};
+
+// 🛡️ CIRCUIT BREAKER: Prevents external network calls from hanging the Lambda
+const withTimeout = (promise: Promise<any>, ms: number) => {
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Network Timeout')), ms));
+    return Promise.race([promise, timeout]);
+};
+
+type OrderItem = { product_id: number; quantity: number; };
+
+async function authorizeVendor(client: PoolClient, cognitoUserId: string, vendorIdFromPath: string | undefined): Promise<number> {
+    const userRes = await client.query('SELECT id, role FROM users WHERE cognito_id = $1', [cognitoUserId]);
+    if (userRes.rows.length === 0) throw new Error('User profile not found');
+    if (userRes.rows[0].role !== 'vendor') throw new Error('Forbidden: User is not a vendor');
+    if (userRes.rows[0].id.toString() !== vendorIdFromPath) throw new Error('Forbidden: Vendor ID mismatch');
+    return userRes.rows[0].id;
+}
+
+export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  const pool = getPool();
+  let client: PoolClient | null = null;
+
+  try {
+    // 🛡️ Move connection INSIDE try block to guarantee release on failure
+    client = await pool.connect(); 
+    
+    const cognitoUserId = event.requestContext.authorizer?.claims.sub;
+    const cognitoUserEmail = event.requestContext.authorizer?.claims?.email; 
+    
+    if (!cognitoUserId) return { statusCode: 401, headers, body: JSON.stringify('Unauthorized') };
+
+    const httpMethod = event.httpMethod;
+    const path = event.path;
+
+    // --- POST /orders (Customer creates order) ---
+    if (httpMethod === 'POST' && path === '/orders') {
+      const body = JSON.parse(event.body || '{}');
+      const idempotencyKey = (event.headers && (event.headers['Idempotency-Key'] || event.headers['idempotency-key'])) || body.idempotency_key || null;
+      const { vendor_id, delivery_location, items } = body as { vendor_id: number, delivery_location: string, items: OrderItem[] | undefined };
+
+      if (!vendor_id || !delivery_location || !items || items.length === 0) {
+        return { statusCode: 400, headers, body: JSON.stringify('Bad Request: Missing fields')};
+      }
+      
+      const userRes = await client.query('SELECT id, name FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      if (userRes.rows.length === 0) return { statusCode: 404, headers, body: JSON.stringify('User profile not found') };
+      
+      const internalUserId = userRes.rows[0].id;
+      const userName = userRes.rows[0].name;
+
+      const productIds = items.map((it) => Number(it.product_id));
+      const invRes = await client.query('SELECT product_id, price, quantity_in_stock FROM inventories WHERE vendor_id = $1 AND product_id = ANY($2::int[])', [vendor_id, productIds]);
+      
+      const priceMap = new Map<number, number>();
+      const stockMap = new Map<number, number>();
+      invRes.rows.forEach(r => {
+          priceMap.set(Number(r.product_id), Number(r.price));
+          stockMap.set(Number(r.product_id), Number(r.quantity_in_stock));
+      });
+
+      let computedTotal = 0;
+      for (const it of items) {
+        const pid = Number(it.product_id);
+        const qty = Number(it.quantity);
+        const price = priceMap.get(pid);
+        const stock = stockMap.get(pid);
+        if (price === undefined || stock === undefined || stock < qty) return { statusCode: 400, headers, body: JSON.stringify(`Stock error for product ${pid}`) };
+        computedTotal += price * qty;
+      }
+
+      await client.query('BEGIN');
+      const orderInsert = `INSERT INTO orders (customer_id, vendor_id, status, delivery_location, total_amount, idempotency_key) VALUES ($1, $2, 'pending', $3, $4, $5) RETURNING id;`;
+      const orderRes = await client.query(orderInsert, [internalUserId, vendor_id, delivery_location, computedTotal, idempotencyKey]);
+      const newOrderId = orderRes.rows[0].id;
+
+      const insertItemText = 'INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase) VALUES ($1, $2, $3, $4)';
+      const updateStockText = 'UPDATE inventories SET quantity_in_stock = quantity_in_stock - $1 WHERE vendor_id = $2 AND product_id = $3';
+
+      for (const it of items) {
+        await client.query(insertItemText, [newOrderId, Number(it.product_id), Number(it.quantity), priceMap.get(Number(it.product_id))!]);
+        await client.query(updateStockText, [Number(it.quantity), vendor_id, Number(it.product_id)]);
+      }
+      await client.query('COMMIT');
+
+      // 🛡️ CIRCUIT BREAKER APPLIED TO EMAIL
+      if (cognitoUserEmail) {
+        try {
+          const message = `Hi ${userName},\n\nYour CARTA order #${newOrderId} has been placed!\nWe will email you a secure PIN when your cart is dispatched.`;
+          const sendCmd = sesClient.send(new SendEmailCommand({
+            Destination: { ToAddresses: [cognitoUserEmail] },
+            Message: { Body: { Text: { Data: message } }, Subject: { Data: `CARTA Order Confirmation (#${newOrderId})` } },
+            Source: SENDER_EMAIL
+          }));
+          await withTimeout(sendCmd, 2000); // Fails gracefully after 2 seconds!
+        } catch (emailErr) { 
+          console.error("SES Timeout Ignored - Order Saved Successfully:", emailErr); 
+        }
+      }
+
+      return { statusCode: 201, headers, body: JSON.stringify({ orderId: newOrderId, total_amount: computedTotal }) };
+    }
+
+    // --- GET /orders & /orders/{orderId} --- 
+    if (httpMethod === 'GET' && path === '/orders') {
+      const userRes = await client.query('SELECT id FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      const res = await client.query('SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC', [userRes.rows[0].id]);
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows) };
+    }
+
+    if (httpMethod === 'GET' && event.pathParameters?.orderId) {
+      const userRes = await client.query('SELECT id FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      const res = await client.query('SELECT * FROM orders WHERE id = $1 AND customer_id = $2', [event.pathParameters.orderId, userRes.rows[0].id]);
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows[0] || {}) };
+    }
+
+    if (httpMethod === 'GET' && path.startsWith('/vendors/') && path.endsWith('/orders')) {
+      const internalUserId = await authorizeVendor(client, cognitoUserId, event.pathParameters?.id);
+      const res = await client.query('SELECT * FROM orders WHERE vendor_id = $1 ORDER BY created_at DESC', [internalUserId]);
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows) };
+    }
+    
+    // --- PUT /orders/{orderId}/status ---
+    if (httpMethod === 'PUT' && event.pathParameters?.orderId && path.endsWith('/status')) {
+      const parsedBody = JSON.parse(event.body || '{}');
+      // FIX 1: Force lowercase so PostgreSQL doesn't panic over capital letters
+      const status = (parsedBody.status || '').toLowerCase(); 
+
+      const allowedStatus = ['pending', 'preparing', 'ready_for_pickup', 'out_for_delivery', 'delivered', 'cancelled', 'returned'];
+      if (!allowedStatus.includes(status)) {
+         return { statusCode: 400, headers, body: JSON.stringify(`Bad Request: Invalid status '${status}'`) };
+      }
+
+      const userRes = await client.query('SELECT id, role FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      if (userRes.rows.length === 0 || userRes.rows[0].role !== 'vendor') {
+         return { statusCode: 403, headers, body: JSON.stringify('Forbidden') };
+      }
+
+      let res;
+      
+      // FIX 2: Completely split the query so we NEVER pass a 'null' variable into PostgreSQL
+      if (status === 'out_for_delivery') {
+          const unlockPin = Math.floor(1000 + Math.random() * 9000).toString();
+          const updateQuery = `
+            UPDATE orders SET status = $1::order_status, updated_at = NOW(),
+            unlock_pin = $4, dispatched_at = NOW()
+            WHERE id = $2 AND vendor_id = $3 RETURNING *;
+          `;
+          res = await client.query(updateQuery, [status, event.pathParameters.orderId, userRes.rows[0].id, unlockPin]);
+
+          // 🛡️ CIRCUIT BREAKER APPLIED TO EMAIL
+          const customerRes = await client.query('SELECT * FROM users WHERE id = $1', [res.rows[0].customer_id]);
+          if (customerRes.rows.length > 0) {
+             const customerEmail = customerRes.rows[0].email || 'your-email@gmail.com'; 
+             try {
+                 const message = `Hi ${customerRes.rows[0].name},\n\nYour CARTA order is out for delivery! PIN: ${unlockPin}`;
+                 const sendCmd = sesClient.send(new SendEmailCommand({
+                   Destination: { ToAddresses: [customerEmail] },
+                   Message: { Body: { Text: { Data: message } }, Subject: { Data: `CARTA Delivery PIN: ${unlockPin}` } },
+                   Source: SENDER_EMAIL
+                 }));
+                 await withTimeout(sendCmd, 2000); // Fails gracefully after 2 seconds
+             } catch (emailErr) { 
+                 console.error("SES Timeout Ignored - Status Updated:", emailErr); 
+             }
+          }
+      } else {
+          // Standard update (No PIN needed)
+          const updateQuery = `
+            UPDATE orders SET status = $1::order_status, updated_at = NOW(),
+            completed_at = CASE WHEN $1::text = 'delivered' THEN NOW() ELSE completed_at END
+            WHERE id = $2 AND vendor_id = $3 RETURNING *;
+          `;
+          res = await client.query(updateQuery, [status, event.pathParameters.orderId, userRes.rows[0].id]);
+      }
+      
+      if (res.rows.length === 0) {
+          return { statusCode: 404, headers, body: JSON.stringify('Order not found or you do not own it') };
+      }
+
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows[0]) };
+    }
+
+    return { statusCode: 405, headers, body: JSON.stringify('Method Not Allowed') };
+  } catch (err) {
+    console.error('Order error:', err);
+    // FIX 3: Actually return the error message so the Vendor App can print it!
+    return { statusCode: 500, headers, body: JSON.stringify({ error: 'Internal Server Error', details: (err as Error).message }) };
+  } finally {
+    // 🛡️ GUARANTEED CLEANUP: Prevents Database Leaks
+    if (client) client.release();
+  }
+}
+*/
+
+
+// sprint 9
+
+
+
+
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { getPool } from './dbPool';
+import { PoolClient } from 'pg';
+import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
+import { IoTDataPlaneClient, PublishCommand } from '@aws-sdk/client-iot-data-plane';
+
+const sesClient = new SESClient({});
+const iotClient = new IoTDataPlaneClient({ region: process.env.AWS_REGION });
+
+// ⚠️ IMPORTANT: Replace with your verified email
+const SENDER_EMAIL = process.env.SENDER_EMAIL || 'thecartateam@gmail.com'; 
+
+const headers = { 
+  'Content-Type': 'application/json',
+  'Access-Control-Allow-Origin': '*', 
+  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET,PUT,DELETE',
+  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Idempotency-Key',
+};
+
+// 🛡️ CIRCUIT BREAKER: Prevents external network calls from hanging the Lambda
+const withTimeout = (promise: Promise<any>, ms: number) => {
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Network Timeout')), ms));
+    return Promise.race([promise, timeout]);
+};
+
+type OrderItem = { product_id: number; quantity: number; };
+
+async function authorizeVendor(client: PoolClient, cognitoUserId: string, vendorIdFromPath: string | undefined): Promise<number> {
+    const userRes = await client.query('SELECT id, role FROM users WHERE cognito_id = $1', [cognitoUserId]);
+    if (userRes.rows.length === 0) throw new Error('User profile not found');
+    if (userRes.rows[0].role !== 'vendor') throw new Error('Forbidden: User is not a vendor');
+    if (userRes.rows[0].id.toString() !== vendorIdFromPath) throw new Error('Forbidden: Vendor ID mismatch');
+    return userRes.rows[0].id;
+}
+
+export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  const pool = getPool();
+  let client: PoolClient | null = null;
+
+  try {
+    // 🛡️ Move connection INSIDE try block to guarantee release on failure
+    client = await pool.connect(); 
+    
+    const cognitoUserId = event.requestContext.authorizer?.claims.sub;
+    const cognitoUserEmail = event.requestContext.authorizer?.claims?.email; 
+    
+    if (!cognitoUserId) return { statusCode: 401, headers, body: JSON.stringify('Unauthorized') };
+
+    const httpMethod = event.httpMethod;
+    const path = event.path;
+
+    // --- POST /orders (Customer creates order) ---
+    if (httpMethod === 'POST' && path === '/orders') {
+      const body = JSON.parse(event.body || '{}');
+      const idempotencyKey = (event.headers && (event.headers['Idempotency-Key'] || event.headers['idempotency-key'])) || body.idempotency_key || null;
+      
+      // NEW: Extract the GPS coordinates from the customer app
+      const { vendor_id, delivery_location, delivery_lat, delivery_lon, items } = body as { vendor_id: number, delivery_location: string, delivery_lat: number, delivery_lon: number, items: OrderItem[] | undefined };
+
+      if (!vendor_id || !delivery_location || !items || items.length === 0) {
+        return { statusCode: 400, headers, body: JSON.stringify('Bad Request: Missing fields')};
+      }
+      
+      const userRes = await client.query('SELECT id, name FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      if (userRes.rows.length === 0) return { statusCode: 404, headers, body: JSON.stringify('User profile not found') };
+      
+      const internalUserId = userRes.rows[0].id;
+      const userName = userRes.rows[0].name;
+
+      const productIds = items.map((it) => Number(it.product_id));
+      const invRes = await client.query('SELECT product_id, price, quantity_in_stock FROM inventories WHERE vendor_id = $1 AND product_id = ANY($2::int[])', [vendor_id, productIds]);
+      
+      const priceMap = new Map<number, number>();
+      const stockMap = new Map<number, number>();
+      invRes.rows.forEach(r => {
+          priceMap.set(Number(r.product_id), Number(r.price));
+          stockMap.set(Number(r.product_id), Number(r.quantity_in_stock));
+      });
+
+      let computedTotal = 0;
+      for (const it of items) {
+        const pid = Number(it.product_id);
+        const qty = Number(it.quantity);
+        const price = priceMap.get(pid);
+        const stock = stockMap.get(pid);
+        if (price === undefined || stock === undefined || stock < qty) return { statusCode: 400, headers, body: JSON.stringify(`Stock error for product ${pid}`) };
+        computedTotal += price * qty;
+      }
+
+      await client.query('BEGIN');
+      
+      // NEW: Insert delivery_lat and delivery_lon into the database securely
+      const orderInsert = `INSERT INTO orders (customer_id, vendor_id, status, delivery_location, delivery_lat, delivery_lon, total_amount, idempotency_key) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7) RETURNING id;`;
+      const orderRes = await client.query(orderInsert, [internalUserId, vendor_id, delivery_location, delivery_lat, delivery_lon, computedTotal, idempotencyKey]);
+      const newOrderId = orderRes.rows[0].id;
+
+      const insertItemText = 'INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase) VALUES ($1, $2, $3, $4)';
+      const updateStockText = 'UPDATE inventories SET quantity_in_stock = quantity_in_stock - $1 WHERE vendor_id = $2 AND product_id = $3';
+
+      for (const it of items) {
+        await client.query(insertItemText, [newOrderId, Number(it.product_id), Number(it.quantity), priceMap.get(Number(it.product_id))!]);
+        await client.query(updateStockText, [Number(it.quantity), vendor_id, Number(it.product_id)]);
+      }
+      await client.query('COMMIT');
+
+      // 🛡️ CIRCUIT BREAKER APPLIED TO EMAIL
+      if (cognitoUserEmail) {
+        try {
+          const message = `Hi ${userName},\n\nYour CARTA order #${newOrderId} has been placed!\nWe will email you a secure PIN when your cart is dispatched.`;
+          const sendCmd = sesClient.send(new SendEmailCommand({
+            Destination: { ToAddresses: [cognitoUserEmail] },
+            Message: { Body: { Text: { Data: message } }, Subject: { Data: `CARTA Order Confirmation (#${newOrderId})` } },
+            Source: SENDER_EMAIL
+          }));
+          await withTimeout(sendCmd, 2000); // Fails gracefully after 2 seconds!
+        } catch (emailErr) { 
+          console.error("SES Timeout Ignored - Order Saved Successfully:", emailErr); 
+        }
+      }
+
+      return { statusCode: 201, headers, body: JSON.stringify({ orderId: newOrderId, total_amount: computedTotal }) };
+    }
+
+    // --- GET /orders & /orders/{orderId} --- 
+    if (httpMethod === 'GET' && path === '/orders') {
+      const userRes = await client.query('SELECT id FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      const res = await client.query('SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC', [userRes.rows[0].id]);
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows) };
+    }
+
+    if (httpMethod === 'GET' && event.pathParameters?.orderId) {
+      const userRes = await client.query('SELECT id FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      const res = await client.query('SELECT * FROM orders WHERE id = $1 AND customer_id = $2', [event.pathParameters.orderId, userRes.rows[0].id]);
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows[0] || {}) };
+    }
+
+    if (httpMethod === 'GET' && path.startsWith('/vendors/') && path.endsWith('/orders')) {
+      const internalUserId = await authorizeVendor(client, cognitoUserId, event.pathParameters?.id);
+      const res = await client.query('SELECT * FROM orders WHERE vendor_id = $1 ORDER BY created_at DESC', [internalUserId]);
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows) };
+    }
+    
+    // --- PUT /orders/{orderId}/status ---
+    if (httpMethod === 'PUT' && event.pathParameters?.orderId && path.endsWith('/status')) {
+      const parsedBody = JSON.parse(event.body || '{}');
+      // FIX 1: Force lowercase so PostgreSQL doesn't panic over capital letters
+      const status = (parsedBody.status || '').toLowerCase(); 
+
+      const allowedStatus = ['pending', 'preparing', 'ready_for_pickup', 'out_for_delivery', 'delivered', 'cancelled', 'returned'];
+      if (!allowedStatus.includes(status)) {
+         return { statusCode: 400, headers, body: JSON.stringify(`Bad Request: Invalid status '${status}'`) };
+      }
+
+      const userRes = await client.query('SELECT id, role FROM users WHERE cognito_id = $1', [cognitoUserId]);
+      if (userRes.rows.length === 0 || userRes.rows[0].role !== 'vendor') {
+         return { statusCode: 403, headers, body: JSON.stringify('Forbidden') };
+      }
+
+      let res;
+      
+      // FIX 2: Completely split the query so we NEVER pass a 'null' variable into PostgreSQL
+      if (status === 'out_for_delivery') {
+          const unlockPin = Math.floor(1000 + Math.random() * 9000).toString();
+          const updateQuery = `
+            UPDATE orders SET status = $1::order_status, updated_at = NOW(),
+            unlock_pin = $4, dispatched_at = NOW()
+            WHERE id = $2 AND vendor_id = $3 RETURNING *;
+          `;
+          res = await client.query(updateQuery, [status, event.pathParameters.orderId, userRes.rows[0].id, unlockPin]);
+
+          const customerRes = await client.query('SELECT * FROM users WHERE id = $1', [res.rows[0].customer_id]);
+          
+          // --- NEW: SEND MQTT DISPATCH COMMAND TO THE HARDWARE TEAM'S CART ---
+          try {
+             // For the graduation project, we default to 'cart_001'
+             const targetCart = parsedBody.cart_id || 'cart_001'; 
+             
+             const dispatchPayload = {
+                 command: "dispatch",
+                 order_id: res.rows[0].id,
+                 customer_name: customerRes.rows[0].name,
+                 delivery_address: res.rows[0].delivery_location,
+                 destination_lat: res.rows[0].delivery_lat,
+                 destination_lon: res.rows[0].delivery_lon,
+                 timestamp: new Date().toISOString()
+             };
+
+             await iotClient.send(new PublishCommand({
+                 topic: `carts/${targetCart}/command`,
+                 payload: Buffer.from(JSON.stringify(dispatchPayload)),
+                 qos: 1
+             }));
+             console.log(`📡 Dispatch command sent to ${targetCart} with GPS coordinates!`);
+          } catch (iotErr) {
+             console.error("❌ Failed to send dispatch command to Cart:", iotErr);
+          }
+          // ------------------------------------------------------------------
+
+          // 🛡️ CIRCUIT BREAKER APPLIED TO EMAIL
+          if (customerRes.rows.length > 0) {
+             const customerEmail = customerRes.rows[0].email || 'your-email@gmail.com'; 
+             try {
+                 const message = `Hi ${customerRes.rows[0].name},\n\nYour CARTA order is out for delivery! PIN: ${unlockPin}`;
+                 const sendCmd = sesClient.send(new SendEmailCommand({
+                   Destination: { ToAddresses: [customerEmail] },
+                   Message: { Body: { Text: { Data: message } }, Subject: { Data: `CARTA Delivery PIN: ${unlockPin}` } },
+                   Source: SENDER_EMAIL
+                 }));
+                 await withTimeout(sendCmd, 2000); // Fails gracefully after 2 seconds
+             } catch (emailErr) { 
+                 console.error("SES Timeout Ignored - Status Updated:", emailErr); 
+             }
+          }
+      } else {
+          // Standard update (No PIN needed)
+          const updateQuery = `
+            UPDATE orders SET status = $1::order_status, updated_at = NOW(),
+            completed_at = CASE WHEN $1::text = 'delivered' THEN NOW() ELSE completed_at END
+            WHERE id = $2 AND vendor_id = $3 RETURNING *;
+          `;
+          res = await client.query(updateQuery, [status, event.pathParameters.orderId, userRes.rows[0].id]);
+      }
+      
+      if (res.rows.length === 0) {
+          return { statusCode: 404, headers, body: JSON.stringify('Order not found or you do not own it') };
+      }
+
+      return { statusCode: 200, headers, body: JSON.stringify(res.rows[0]) };
+    }
+
+    return { statusCode: 405, headers, body: JSON.stringify('Method Not Allowed') };
+  } catch (err) {
+    console.error('Order error:', err);
+    // FIX 3: Actually return the error message so the Vendor App can print it!
+    return { statusCode: 500, headers, body: JSON.stringify({ error: 'Internal Server Error', details: (err as Error).message }) };
+  } finally {
+    // 🛡️ GUARANTEED CLEANUP: Prevents Database Leaks
+    if (client) client.release();
   }
 }

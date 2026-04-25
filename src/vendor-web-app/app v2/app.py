@@ -55,7 +55,7 @@ def update_order_status(order_id, status):
         st.success(f"Order #{order_id} status updated to {status}!")
         st.rerun()
     else:
-        st.error("Failed to update status.")
+        st.error(f"Failed to update status: {res.text}")
 
 def add_product(name, sku, price, stock, desc, img):
     payload = {

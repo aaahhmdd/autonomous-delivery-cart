@@ -3,5 +3,10 @@
     "me-south-1a",
     "me-south-1b",
     "me-south-1c"
+  ],
+  "availability-zones:account=834508804120:region=eu-central-1": [
+    "eu-central-1a",
+    "eu-central-1b",
+    "eu-central-1c"
   ]
 }

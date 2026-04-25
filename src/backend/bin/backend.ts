@@ -13,7 +13,7 @@ new BackendStack(app, 'BackendStack', {
     account: '834508804120', 
 
     // This is the region you configured in your AWS CLI.
-    region: 'me-south-1' 
+    region: 'eu-central-1' 
   },
 });
 
